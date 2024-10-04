@@ -2,7 +2,7 @@
   "name": "codesent",
   "displayName": "CodeSent for Apigee",
   "description": "Empower your development process with cutting-edge static analysis augmented with dynamic-like code processing for Apigee API Gateway",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "icon": "assets/icon.png",
   "repository": {
     "url": "https://github.com/codesentio/codesent-vscode-extension"
@@ -21,7 +21,7 @@
   ],
   "galleryBanner": {
     "color": "#4E0D59",
-    "theme": "light"
+    "theme": "dark"
   },
   "activationEvents": [
     "onStartupFinished",
