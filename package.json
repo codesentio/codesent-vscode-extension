@@ -2,13 +2,27 @@
   "name": "codesent",
   "displayName": "CodeSent for Apigee",
   "description": "Empower your development process with cutting-edge static analysis augmented with dynamic-like code processing for Apigee API Gateway",
-  "version": "0.0.1",
+  "version": "1.0.1",
+  "icon": "assets/icon.png",
+  "repository": {
+    "url": "https://github.com/codesentio/codesent-vscode-extension"
+  },
+  "publisher": "NikitaMarkevich",
   "engines": {
     "vscode": "^1.75.0"
   },
   "categories": [
-    "Other"
+    "Linters"
   ],
+  "keywords": [
+    "Apigee",
+    "SAST",
+    "lint"
+  ],
+  "galleryBanner": {
+    "color": "#4E0D59",
+    "theme": "light"
+  },
   "activationEvents": [
     "onStartupFinished",
     "workspaceContains:apiproxy/**"
@@ -83,7 +97,7 @@
     "@types/fs-extra": "^11.0.4",
     "@types/mocha": "^10.0.8",
     "@types/node": "20.x",
-    "@types/vscode": "^1.93.0",
+    "@types/vscode": "^1.75.0",
     "@typescript-eslint/eslint-plugin": "^8.7.0",
     "@typescript-eslint/parser": "^8.7.0",
     "@vscode/test-cli": "^0.0.10",
