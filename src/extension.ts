@@ -1,8 +1,68 @@
+// src/extension.ts
+
 import * as vscode from 'vscode';
+import { sep } from 'path';
 import archiver from 'archiver';
 import * as stream from 'stream';
 import axios from 'axios';
 import FormData from 'form-data';
+import { GitExtension, API, Repository, Branch, Commit, Change, RefType } from './api/git'; // Adjust the import path based on your project structure
+
+// A map to store the last known branch and commit for each repository
+const repoStates: Map<string, { branch: string; commit: string }> = new Map();
+
+// Debounce timer to prevent multiple prompts
+let debounceTimer: NodeJS.Timeout | null = null;
+const DEBOUNCE_DELAY = 3000; // 3 seconds
+
+// Flag to indicate if the extension is in the initialization phase
+let isInitializing: boolean = true;
+
+/**
+ * Retrieves the Git Extension API.
+ * @returns GitExtension instance or undefined if Git is not available.
+ */
+function getGitExtension(): GitExtension | undefined {
+    const gitExtension = vscode.extensions.getExtension<GitExtension>('vscode.git')?.exports;
+    if (!gitExtension) {
+        return undefined;
+    }
+    return gitExtension;
+}
+
+function isWindowsPath(path: string): boolean {
+    return /^[a-zA-Z]:\\/.test(path);
+}
+
+function isDescendant(parent: string, descendant: string, separator: string = sep): boolean {
+    if (parent === descendant) {
+        return true;
+    }
+
+    if (parent.charAt(parent.length - 1) !== separator) {
+        parent += separator;
+    }
+
+    // Windows is case insensitive
+    if (isWindowsPath(parent)) {
+        parent = parent.toLowerCase();
+        descendant = descendant.toLowerCase();
+    }
+
+    return descendant.startsWith(parent);
+}
+
+/**
+ * Retrieves the current Git branch and commit hash.
+ * @param repo The repository to retrieve information from.
+ * @returns Object containing branch name and commit hash, or null if not available.
+ */
+async function getGitInfo(repo: Repository): Promise<{ branch: string; commit: string } | null> {
+    const branch = repo.state.HEAD ? repo.state.HEAD.name || 'N/A' : 'N/A';
+    const commit = repo.state.HEAD ? repo.state.HEAD.commit || 'N/A' : 'N/A';
+
+    return { branch, commit };
+}
 
 /**
  * Compresses the specified directory into a ZIP archive and returns it as a Buffer.
@@ -27,18 +87,28 @@ async function zipDirectoryToBuffer(source: string): Promise<Buffer> {
 }
 
 /**
- * Uploads the ZIP archive buffer to the CodeSent API.
+ * Uploads the ZIP archive buffer to the CodeSent API along with Git information.
  * @param zipBuffer Buffer containing the ZIP archive.
  * @param apiUrl Base URL of the CodeSent API.
  * @param apiKey API key for authorization.
+ * @param gitInfo Object containing Git branch and commit hash.
  * @returns Promise resolving to the Proxy UUID.
  */
-async function uploadZip(zipBuffer: Buffer, apiUrl: string, apiKey: string): Promise<string> {
+async function uploadZip(
+    zipBuffer: Buffer,
+    apiUrl: string,
+    apiKey: string,
+    gitInfo: { branch: string; commit: string }
+): Promise<string> {
     const formData = new FormData();
     formData.append('file', zipBuffer, {
         filename: 'proxy.zip',
         contentType: 'application/zip',
     });
+
+    // Append Git information as additional fields
+    formData.append('branch', gitInfo.branch);
+    formData.append('commit_hash', gitInfo.commit);
 
     const response = await axios.post(`${apiUrl}/upload`, formData, {
         headers: {
@@ -47,7 +117,7 @@ async function uploadZip(zipBuffer: Buffer, apiUrl: string, apiKey: string): Pro
         },
         validateStatus: function (status) {
             return true; // Resolve all HTTP status codes
-        }
+        },
     });
 
     if (response.status === 200) {
@@ -228,6 +298,104 @@ async function promptForApiKey(context: vscode.ExtensionContext): Promise<string
 }
 
 /**
+ * Registers event listeners for Git repository changes.
+ * @param git GitAPI instance.
+ * @param context Extension context.
+ * @param outputChannel The output channel for logging.
+ */
+function registerGitEventListeners(git: API, context: vscode.ExtensionContext, outputChannel: vscode.OutputChannel) {
+    // Iterate through all existing repositories
+    git.repositories.forEach(repo => {
+        // Initialize the last known state
+        repoStates.set(repo.rootUri.fsPath, { branch: 'N/A', commit: 'N/A' });
+
+        // Listen for state changes in each repository
+        repo.state.onDidChange(() => {
+            handleRepoStateChange(repo, outputChannel);
+        });
+    });
+
+    // Listen for new repositories being opened
+    git.onDidOpenRepository(repo => {
+        repoStates.set(repo.rootUri.fsPath, { branch: 'N/A', commit: 'N/A' });
+
+        repo.state.onDidChange(() => {
+            handleRepoStateChange(repo, outputChannel);
+        });
+    });
+
+    // Listen for repositories being closed
+    git.onDidCloseRepository(repo => {
+        repoStates.delete(repo.rootUri.fsPath);
+    });
+}
+
+/**
+ * Handles state changes for a repository.
+ * @param repo The repository that changed state.
+ * @param outputChannel The output channel for logging.
+ */
+async function handleRepoStateChange(repo: Repository, outputChannel: vscode.OutputChannel) {
+    const previousState = repoStates.get(repo.rootUri.fsPath);
+    const gitInfo = await getGitInfo(repo);
+
+    outputChannel.appendLine(`\nhandleRepoStateChange called for repository: ${repo.rootUri.fsPath}`);
+
+    if (!gitInfo) {
+        outputChannel.appendLine(`No Git info available for repository: ${repo.rootUri.fsPath}`);
+        return;
+    }
+
+    const currentBranch = gitInfo.branch;
+    const currentCommit = gitInfo.commit;
+
+    outputChannel.appendLine(`Previous Branch: ${previousState?.branch}, Current Branch: ${currentBranch}`);
+    outputChannel.appendLine(`Previous Commit: ${previousState?.commit}, Current Commit: ${currentCommit}`);
+
+    // Check if branch or commit has changed
+    const branchChanged = previousState?.branch !== currentBranch;
+    const commitChanged = previousState?.commit !== currentCommit;
+
+    outputChannel.appendLine(`Branch changed: ${branchChanged}, Commit changed: ${commitChanged}`);
+
+    // Update the stored state
+    repoStates.set(repo.rootUri.fsPath, { branch: currentBranch, commit: currentCommit });
+
+    if (branchChanged || commitChanged) {
+        // Debounce to prevent multiple prompts in quick succession
+        if (debounceTimer) {
+            clearTimeout(debounceTimer);
+        }
+
+        debounceTimer = setTimeout(async () => {
+            // Check if the workspace is an Apigee project
+            const isApigee = await isApigeeProject();
+            outputChannel.appendLine(`Apigee project detected: ${isApigee}`);
+
+            if (isApigee && !isInitializing) { // Only prompt if not initializing
+                // Consolidate message based on what changed
+                let message = 'Detected changes in your Git repository:\n';
+                if (branchChanged) {
+                    message += `- Branch changed to "${currentBranch}".\n`;
+                }
+                if (commitChanged) {
+                    message += `- New commit: ${currentCommit}.\n`;
+                }
+                message += 'Do you want to perform a CodeSent scan?';
+
+                const options: string[] = ['Yes', 'No'];
+
+                const selected = await vscode.window.showInformationMessage(message, ...options);
+                if (selected === 'Yes') {
+                    vscode.commands.executeCommand('codesentScanner.scanProxy');
+                    outputChannel.appendLine('User opted to start the scan from Git event.');
+                }
+            }
+        }, DEBOUNCE_DELAY);
+    }
+}
+
+/**
  * Activates the extension.
  * @param context Extension context.
  */
@@ -241,7 +409,7 @@ export async function activate(context: vscode.ExtensionContext) {
     // Variable to hold the status bar item
     let statusBarItem: vscode.StatusBarItem | undefined;
 
-    // Flag to track if the scan prompt has been shown
+    // Flag to track if the scan prompt has been shown during initialization
     let hasPromptedScan = false;
 
     /**
@@ -282,7 +450,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
             if (!hasPromptedScan) {
                 const message = 'Apigee proxy detected. Do you want to perform a CodeSent scan?';
-                const options: string[] = ['Start Scan'];
+                const options: string[] = ['Start Scan', 'Later'];
 
                 const selected = await vscode.window.showInformationMessage(message, ...options);
 
@@ -299,6 +467,9 @@ export async function activate(context: vscode.ExtensionContext) {
             hideStatusBarItem();
             hasPromptedScan = false;
         }
+
+        // After initialization, set isInitializing to false
+        isInitializing = false;
     }
 
     // Listen for workspace folder changes
@@ -308,6 +479,20 @@ export async function activate(context: vscode.ExtensionContext) {
     });
 
     context.subscriptions.push(workspaceChangeDisposable);
+
+    // Access Git Extension API
+    const gitExtension = getGitExtension();
+    if (gitExtension) {
+        const git = gitExtension.getAPI(1);
+        if (git) {
+            // Register Git event listeners
+            registerGitEventListeners(git, context, outputChannel);
+        } else {
+            outputChannel.appendLine('Git API not available.');
+        }
+    } else {
+        outputChannel.appendLine('Git extension not found.');
+    }
 
     /**
      * Registers the 'Scan Apigee Proxy with CodeSent' command.
@@ -341,6 +526,27 @@ export async function activate(context: vscode.ExtensionContext) {
         const workspacePath = workspaceFolders[0].uri.fsPath;
         outputChannel.appendLine(`Workspace Path: ${workspacePath}`);
 
+        // Retrieve Git Information from the primary repository
+        const git = getGitExtension()?.getAPI(1);
+        let gitInfo = { branch: 'N/A', commit: 'N/A' };
+        if (git) {
+            const primaryRepo = git.repositories.find(repo => isDescendant(repo.rootUri.fsPath, workspacePath));
+            if (primaryRepo) {
+                const info = await getGitInfo(primaryRepo);
+                if (info) {
+                    gitInfo = info;
+                    outputChannel.appendLine(`Git Branch: ${gitInfo.branch}`);
+                    outputChannel.appendLine(`Git Commit Hash: ${gitInfo.commit}`);
+                } else {
+                    outputChannel.appendLine('No Git information available.');
+                }
+            } else {
+                outputChannel.appendLine('No primary Git repository found.');
+            }
+        } else {
+            outputChannel.appendLine('Git API not available.');
+        }
+
         try {
             await vscode.window.withProgress({
                 location: vscode.ProgressLocation.Notification,
@@ -348,7 +554,7 @@ export async function activate(context: vscode.ExtensionContext) {
                 cancellable: false
             }, async (progress) => {
                 outputChannel.appendLine('Starting scan process...');
-                
+
                 progress.report({ message: "Creating ZIP archive..." });
                 outputChannel.appendLine('Creating ZIP archive...');
                 const zipBuffer = await zipDirectoryToBuffer(workspacePath);
@@ -356,7 +562,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
                 progress.report({ message: "Uploading ZIP archive..." });
                 outputChannel.appendLine('Uploading ZIP archive...');
-                const proxyUuid = await uploadZip(zipBuffer, apiUrl, apiKey);
+                const proxyUuid = await uploadZip(zipBuffer, apiUrl, apiKey, gitInfo);
                 outputChannel.appendLine(`ZIP archive uploaded. Proxy UUID: ${proxyUuid}`);
 
                 progress.report({ message: "Initiating validation..." });
@@ -436,7 +642,7 @@ export async function activate(context: vscode.ExtensionContext) {
         if (apiKey) {
             await context.secrets.store('codesentScanner.apiKey', apiKey);
             vscode.window.showInformationMessage('API Key stored successfully.');
-            outputChannel.appendLine('API Key stored successfully.');
+            vscode.window.showInformationMessage('API Key stored successfully.');
         } else {
             vscode.window.showErrorMessage('API Key entry was canceled.');
             outputChannel.appendLine('API Key entry was canceled.');
@@ -474,6 +680,104 @@ export async function activate(context: vscode.ExtensionContext) {
     });
 
     context.subscriptions.push(deleteApiKeyDisposable);
+
+    /**
+     * Registers event listeners for Git repository changes.
+     * @param git GitAPI instance.
+     * @param context Extension context.
+     * @param outputChannel The output channel for logging.
+     */
+    function registerGitEventListeners(git: API, context: vscode.ExtensionContext, outputChannel: vscode.OutputChannel) {
+        // Iterate through all existing repositories
+        git.repositories.forEach(repo => {
+            // Initialize the last known state
+            repoStates.set(repo.rootUri.fsPath, { branch: 'N/A', commit: 'N/A' });
+
+            // Listen for state changes in each repository
+            repo.state.onDidChange(() => {
+                handleRepoStateChange(repo, outputChannel);
+            });
+        });
+
+        // Listen for new repositories being opened
+        git.onDidOpenRepository(repo => {
+            repoStates.set(repo.rootUri.fsPath, { branch: 'N/A', commit: 'N/A' });
+
+            repo.state.onDidChange(() => {
+                handleRepoStateChange(repo, outputChannel);
+            });
+        });
+
+        // Listen for repositories being closed
+        git.onDidCloseRepository(repo => {
+            repoStates.delete(repo.rootUri.fsPath);
+        });
+    }
+
+    /**
+     * Handles state changes for a repository.
+     * @param repo The repository that changed state.
+     * @param outputChannel The output channel for logging.
+     */
+    async function handleRepoStateChange(repo: Repository, outputChannel: vscode.OutputChannel) {
+        const previousState = repoStates.get(repo.rootUri.fsPath);
+        const gitInfo = await getGitInfo(repo);
+
+        outputChannel.appendLine(`\nhandleRepoStateChange called for repository: ${repo.rootUri.fsPath}`);
+
+        if (!gitInfo) {
+            outputChannel.appendLine(`No Git info available for repository: ${repo.rootUri.fsPath}`);
+            return;
+        }
+
+        const currentBranch = gitInfo.branch;
+        const currentCommit = gitInfo.commit;
+
+        outputChannel.appendLine(`Previous Branch: ${previousState?.branch}, Current Branch: ${currentBranch}`);
+        outputChannel.appendLine(`Previous Commit: ${previousState?.commit}, Current Commit: ${currentCommit}`);
+
+        // Check if branch or commit has changed
+        const branchChanged = previousState?.branch !== currentBranch;
+        const commitChanged = previousState?.commit !== currentCommit;
+
+        outputChannel.appendLine(`Branch changed: ${branchChanged}, Commit changed: ${commitChanged}`);
+
+        // Update the stored state
+        repoStates.set(repo.rootUri.fsPath, { branch: currentBranch, commit: currentCommit });
+
+        if (branchChanged || commitChanged) {
+            // Debounce to prevent multiple prompts in quick succession
+            if (debounceTimer) {
+                clearTimeout(debounceTimer);
+            }
+
+            debounceTimer = setTimeout(async () => {
+                // Check if the workspace is an Apigee project
+                const isApigee = await isApigeeProject();
+                outputChannel.appendLine(`Apigee project detected: ${isApigee}`);
+
+                if (isApigee && !isInitializing) { // Only prompt if not initializing
+                    // Consolidate message based on what changed
+                    let message = 'Detected changes in your Git repository:\n';
+                    if (branchChanged) {
+                        message += `- Branch changed to "${currentBranch}".\n`;
+                    }
+                    if (commitChanged) {
+                        message += `- New commit: ${currentCommit}.\n`;
+                    }
+                    message += 'Do you want to perform a CodeSent scan?';
+
+                    const options: string[] = ['Yes', 'No'];
+
+                    const selected = await vscode.window.showInformationMessage(message, ...options);
+                    if (selected === 'Yes') {
+                        vscode.commands.executeCommand('codesentScanner.scanProxy');
+                        outputChannel.appendLine('User opted to start the scan from Git event.');
+                    }
+                }
+            }, DEBOUNCE_DELAY);
+        }
+    }
     
     // Initial check when the extension is activated
     await initialize();
