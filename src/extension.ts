@@ -18,6 +18,9 @@ const DEBOUNCE_DELAY = 3000; // 3 seconds
 // Flag to indicate if the extension is in the initialization phase
 let isInitializing: boolean = true;
 
+// Flag to indicate if a scan is currently in progress
+let isScanning: boolean = false;
+
 /**
  * Retrieves the Git Extension API.
  * @returns GitExtension instance or undefined if Git is not available.
@@ -500,6 +503,16 @@ export async function activate(context: vscode.ExtensionContext) {
     let scanProxyDisposable = vscode.commands.registerCommand('codesentScanner.scanProxy', async () => {
         outputChannel.appendLine('scanProxy command invoked.');
 
+        // Check if a scan is already in progress
+        if (isScanning) {
+            vscode.window.showInformationMessage('A scan is already in progress. Please wait until the current scan completes.');
+            outputChannel.appendLine('Scan aborted: Another scan is already in progress.');
+            return;
+        }
+
+        // Set the scanning flag to true
+        isScanning = true;
+
         let apiKey = await getApiKey(context);
 
         if (!apiKey) {
@@ -624,6 +637,10 @@ export async function activate(context: vscode.ExtensionContext) {
                 vscode.window.showErrorMessage(`An error occurred: ${error.message}`);
                 outputChannel.appendLine(`An error occurred: ${error.message}`);
             }
+        } finally {
+            // Reset the scanning flag
+            isScanning = false;
+            outputChannel.appendLine('Scan process ended. isScanning flag reset to false.');
         }
     });
 
@@ -642,7 +659,7 @@ export async function activate(context: vscode.ExtensionContext) {
         if (apiKey) {
             await context.secrets.store('codesentScanner.apiKey', apiKey);
             vscode.window.showInformationMessage('API Key stored successfully.');
-            vscode.window.showInformationMessage('API Key stored successfully.');
+            outputChannel.appendLine('API Key stored successfully.');
         } else {
             vscode.window.showErrorMessage('API Key entry was canceled.');
             outputChannel.appendLine('API Key entry was canceled.');
@@ -778,7 +795,7 @@ export async function activate(context: vscode.ExtensionContext) {
             }, DEBOUNCE_DELAY);
         }
     }
-    
+
     // Initial check when the extension is activated
     await initialize();
 }
